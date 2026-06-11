@@ -40,6 +40,17 @@ async def local_extract_vision(
         b64 = base64.b64encode(image_source).decode()
         image_url_payload = {"url": f"data:image/jpeg;base64,{b64}"}
 
+    # Short, direct prompt — small VLMs (LFM2/FastVLM) generate ~25ms/token, so a
+    # verbose JSON-rules prompt + high max_tokens blows latency up 4x. We override
+    # the caller's prompt with a terse one and cap max_tokens low. The extra fields
+    # (name/symbol) are coerced from the model's short answer by _parse_json_loose.
+    short_prompt = os.environ.get(
+        "LOCAL_VISION_PROMPT",
+        'Name and ticker symbol of the meme token in this image. '
+        'JSON only: {"name":"...","symbol":"..."}',
+    )
+    max_tok = int(os.environ.get("LOCAL_VISION_MAX_TOKENS", "20"))
+
     t0 = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=LOCAL_VISION_TIMEOUT) as client:
@@ -52,13 +63,13 @@ async def local_extract_vision(
                         {
                             "role": "user",
                             "content": [
-                                {"type": "text", "text": prompt},
+                                {"type": "text", "text": short_prompt},
                                 {"type": "image_url", "image_url": image_url_payload},
                             ],
                         },
                     ],
                     "temperature": 0.0,
-                    "max_tokens": 64,
+                    "max_tokens": max_tok,
                     "response_format": {"type": "json_object"},
                 },
             )
