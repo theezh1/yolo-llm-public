@@ -71,8 +71,21 @@ def _is_fastvlm() -> bool:
     return "fastvlm" in hay
 
 
-# backend = "fastvlm" | "moondream"
-BACKEND = "fastvlm" if _is_fastvlm() else "moondream"
+def _is_lfm2() -> bool:
+    """LFM2 backend selected when the model id mentions lfm2 (LiquidAI LFM2-VL)."""
+    return "lfm2" in MODEL_ID.lower()
+
+
+def _select_backend() -> str:
+    if _is_lfm2():
+        return "lfm2"
+    if _is_fastvlm():
+        return "fastvlm"
+    return "moondream"
+
+
+# backend = "lfm2" | "fastvlm" | "moondream"
+BACKEND = _select_backend()
 
 app = FastAPI(title="yolo-llm-public vision server", version="2.0.0")
 
@@ -137,6 +150,38 @@ def _load_fastvlm(device: str) -> None:
     log.info("FastVLM loaded.")
 
 
+def _load_lfm2(device: str) -> None:
+    """Load LiquidAI LFM2-VL (standard transformers >= 4.57, AutoModelForImageTextToText).
+
+    LFM2-VL is a liquid-neural-net VLM that loads as a normal transformers checkpoint
+    (unlike FastVLM). ChatML template, <image> sentinel, processor.apply_chat_template.
+    Works for both the base LFM2-VL-450M and the LFM2.5-VL-*-Extract variants.
+    """
+    import torch
+    from transformers import AutoProcessor, AutoModelForImageTextToText
+
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    log.info(f"Loading LFM2-VL checkpoint {MODEL_ID} on {device} (dtype={dtype}) ...")
+    model = AutoModelForImageTextToText.from_pretrained(
+        MODEL_ID,
+        device_map="auto" if device == "cuda" else None,
+        dtype=dtype,
+        trust_remote_code=True,
+        token=HF_TOKEN,
+        revision=MODEL_REVISION,
+    )
+    if device != "cuda":
+        model = model.to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(
+        MODEL_ID, trust_remote_code=True, token=HF_TOKEN, revision=MODEL_REVISION
+    )
+    # image_processor slot reused to carry the processor for LFM2.
+    _state.update(model=model, tokenizer=processor, image_processor=processor,
+                  device=device, loaded=True, backend="lfm2")
+    log.info("LFM2-VL loaded.")
+
+
 def _load_moondream(device: str) -> None:
     """Load Moondream (or any generic trust_remote_code VLM) via transformers."""
     import torch
@@ -163,7 +208,9 @@ def _ensure_model() -> None:
     device = _resolve_device()
     if device == "cpu":
         log.warning("Loading vision model on CPU — this is SLOW. Use a GPU for real workloads.")
-    if BACKEND == "fastvlm":
+    if BACKEND == "lfm2":
+        _load_lfm2(device)
+    elif BACKEND == "fastvlm":
         _load_fastvlm(device)
     else:
         _load_moondream(device)
@@ -267,6 +314,68 @@ def _infer_fastvlm(text_prompt: str, image, max_tokens: int) -> str:
     return tok.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
 
 
+def _infer_lfm2(text_prompt: str, image, max_tokens: int) -> str:
+    """Run LiquidAI LFM2-VL via ChatML chat template.
+
+    For the base model: user message with [image, text].
+    For the *-Extract* variants: a system prompt describing the JSON fields to
+    extract plus a user image — the Extract models are tuned to emit pure JSON.
+    Gen params per model card: temperature=0.1, min_p=0.15, repetition_penalty=1.05.
+    """
+    import torch
+
+    model = _state["model"]
+    processor = _state["image_processor"]
+    device = _state["device"]
+
+    is_extract = "extract" in MODEL_ID.lower()
+    if is_extract:
+        # Extract variant: schema in system prompt, image in user turn.
+        system_prompt = (
+            "Extract the following from the image:\n\n"
+            "name: The name of the pump.fun meme token shown in the image\n"
+            "symbol: The ticker symbol (uppercase, 3-10 letters) of the token\n\n"
+            "Respond with only a JSON object."
+        )
+        conversation = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [{"type": "image", "image": image}]},
+        ]
+    else:
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": text_prompt},
+                ],
+            },
+        ]
+
+    inputs = processor.apply_chat_template(
+        conversation,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+        tokenize=True,
+    ).to(model.device)
+
+    gen_kwargs = dict(
+        max_new_tokens=max_tokens,
+        do_sample=True,
+        temperature=0.1,
+        min_p=0.15,
+        repetition_penalty=1.05,
+    )
+    with torch.inference_mode():
+        out_ids = model.generate(**inputs, **gen_kwargs)
+
+    # Strip the prompt tokens; decode only the newly generated continuation.
+    gen_only = out_ids[0][inputs["input_ids"].shape[1]:]
+    text = processor.decode(gen_only, skip_special_tokens=True)
+    return text.strip()
+
+
 def _infer_moondream(text_prompt: str, image, max_tokens: int) -> str:
     import torch
     model = _state["model"]
@@ -294,7 +403,9 @@ def _infer_moondream(text_prompt: str, image, max_tokens: int) -> str:
 def _run_inference(text_prompt: str, image, max_tokens: int) -> tuple[str, float]:
     """Dispatch to the active backend. Returns (raw_text, inference_ms)."""
     t0 = time.perf_counter()
-    if _state["backend"] == "fastvlm":
+    if _state["backend"] == "lfm2":
+        raw = _infer_lfm2(text_prompt, image, max_tokens)
+    elif _state["backend"] == "fastvlm":
         raw = _infer_fastvlm(text_prompt, image, max_tokens)
     else:
         raw = _infer_moondream(text_prompt, image, max_tokens)
