@@ -39,7 +39,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("vision-server")
 
-MODEL_ID = os.environ.get("LOCAL_VISION_MODEL", "apple/FastVLM-0.5B")
+# Moondream2 is the default — it loads cleanly via transformers + trust_remote_code
+# and exposes a high-level .query()/.caption() API. apple/FastVLM-0.5B is NOT a
+# standard transformers checkpoint (needs apple/ml-fastvlm repo code), so it is
+# documented but not the default.
+MODEL_ID = os.environ.get("LOCAL_VISION_MODEL", "vikhyatk/moondream2")
+MODEL_REVISION = os.environ.get("LOCAL_VISION_REVISION", "").strip() or None
 DEVICE_PREF = os.environ.get("VISION_DEVICE", "auto").strip().lower()
 LAZY_LOAD = os.environ.get("VISION_LAZY_LOAD", "1").strip() not in ("0", "false", "no")
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
@@ -81,14 +86,18 @@ def _ensure_model() -> None:
         log.warning("Loading vision model on CPU — this is SLOW. Use a GPU for real workloads.")
     log.info(f"Loading vision model {MODEL_ID} on {device} ...")
 
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, token=HF_TOKEN)
     import torch as _torch
     dtype = _torch.float16 if device == "cuda" else _torch.float32
+
+    tok = AutoTokenizer.from_pretrained(
+        MODEL_ID, trust_remote_code=True, token=HF_TOKEN, revision=MODEL_REVISION
+    )
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         trust_remote_code=True,
         torch_dtype=dtype,
         token=HF_TOKEN,
+        revision=MODEL_REVISION,
     ).to(device)
     model.eval()
 
@@ -155,16 +164,19 @@ def _run_inference(text_prompt: str, image, max_tokens: int) -> str:
     tok = _state["tokenizer"]
     device = _state["device"]
 
-    # Moondream exposes a high-level .query / .answer_question API.
-    if hasattr(model, "answer_question") and hasattr(model, "encode_image"):
-        enc = model.encode_image(image)
-        return model.answer_question(enc, text_prompt, tok)
+    # Moondream2 (new API ≥2025): model.query(image, question) -> {"answer": ...}
     if hasattr(model, "query"):
         try:
             out = model.query(image, text_prompt)
-            return out["answer"] if isinstance(out, dict) else str(out)
-        except Exception:
-            pass
+            ans = out.get("answer") if isinstance(out, dict) else out
+            if ans:
+                return str(ans)
+        except Exception as e:
+            log.warning(f"moondream .query failed, trying encode_image: {e!r}")
+    # Moondream2 (old API): encode_image + answer_question
+    if hasattr(model, "encode_image") and hasattr(model, "answer_question"):
+        enc = model.encode_image(image)
+        return model.answer_question(enc, text_prompt, tok)
 
     # Generic transformers path (FastVLM-style): build chat prompt with <image>.
     prompt = f"<image>\n{text_prompt}"
