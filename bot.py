@@ -56,6 +56,8 @@ CROP_OUT_SIZE = int(os.environ.get("CROP_OUT_SIZE", "512"))  # square crops resi
 
 # Vision backend switch: "groq" (API) or "local" (FastVLM server).
 VISION_BACKEND = os.environ.get("VISION_BACKEND", "groq").strip().lower()
+# Local model id — used only for the timing-line label (actual call is in local_vision.py).
+LOCAL_VISION_MODEL = os.environ.get("LOCAL_VISION_MODEL", "local-vision")
 
 # Groq API for name/symbol extraction (text + vision).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -567,6 +569,13 @@ async def _process_image_source(
     symbol = (extract or {}).get("symbol", "?")
     mode = "vision" if use_vision else "text"
 
+    # Short label of the model that actually ran the extract, for the timing line.
+    if use_vision:
+        _m = GROQ_VISION_MODEL if VISION_BACKEND == "groq" else LOCAL_VISION_MODEL
+    else:
+        _m = GROQ_MODEL
+    model_label = _m.split("/")[-1]  # strip org prefix (LiquidAI/…, meta-llama/…)
+
     def fmt_mcap(v: float) -> str:
         if v >= 1_000_000:
             return f"${v/1_000_000:.1f}M"
@@ -597,7 +606,7 @@ async def _process_image_source(
     lines.append("")
     lines.append(f"<i>processing: {total_ms:.0f}ms</i> (yolo ∥ (extract→dex)) · <i>via: {via}</i>")
     lines.append(
-        f"  yolo: {yolo_ms:.0f}ms · extract: {extract_ms:.0f}ms · dex: {dex_ms:.0f}ms · crop: {crop_ms:.0f}ms"
+        f"  yolo: {yolo_ms:.0f}ms · {model_label}: {extract_ms:.0f}ms · dex: {dex_ms:.0f}ms · crop: {crop_ms:.0f}ms"
     )
     if crop_label:
         lines.append(f"  crop: {crop_label}")
