@@ -330,15 +330,19 @@ def _infer_lfm2(text_prompt: str, image, max_tokens: int) -> str:
 
     is_extract = "extract" in MODEL_ID.lower()
     if is_extract:
-        # Extract variant: schema in system prompt, image in user turn.
+        # Extract variant: YAML-style field schema in system prompt, image in user
+        # turn. The Extract models are tuned to emit pure JSON. transformers v5
+        # requires every message["content"] to be a list of typed parts, so the
+        # system text is wrapped too. The symbol is intentionally left loose — the
+        # server's _coerce_json/_derive_symbol cleans it up from the name.
         system_prompt = (
             "Extract the following from the image:\n\n"
-            "name: The name of the pump.fun meme token shown in the image\n"
-            "symbol: The ticker symbol (uppercase, 3-10 letters) of the token\n\n"
+            "name: The name of the main character, subject, or prominent text shown in the image\n"
+            "symbol: An uppercase ticker symbol for a meme token based on the name\n\n"
             "Respond with only a JSON object."
         )
         conversation = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
             {"role": "user", "content": [{"type": "image", "image": image}]},
         ]
     else:
@@ -360,13 +364,18 @@ def _infer_lfm2(text_prompt: str, image, max_tokens: int) -> str:
         tokenize=True,
     ).to(model.device)
 
-    gen_kwargs = dict(
-        max_new_tokens=max_tokens,
-        do_sample=True,
-        temperature=0.1,
-        min_p=0.15,
-        repetition_penalty=1.05,
-    )
+    if is_extract:
+        # Extract model card recommends greedy decoding for deterministic JSON.
+        gen_kwargs = dict(max_new_tokens=max_tokens, do_sample=False)
+    else:
+        # Base LFM2-VL sampling params per model card.
+        gen_kwargs = dict(
+            max_new_tokens=max_tokens,
+            do_sample=True,
+            temperature=0.1,
+            min_p=0.15,
+            repetition_penalty=1.05,
+        )
     with torch.inference_mode():
         out_ids = model.generate(**inputs, **gen_kwargs)
 
