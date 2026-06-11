@@ -1,0 +1,8 @@
+# Bot runtime deps. Vision-server (torch/transformers) deps live in
+# vision_server/requirements.txt and are only needed when VISION_BACKEND=local.
+python-telegram-bot>=21.0
+python-dotenv>=1.0
+httpx>=0.27
+numpy>=1.26
+pillow>=10.0
+ultralytics>=8.3

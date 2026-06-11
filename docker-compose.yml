@@ -1,0 +1,40 @@
+# Two services from one image:
+#   vision-server — FastVLM on GPU, OpenAI-compatible :8100 (only used when
+#                   VISION_BACKEND=local; harmless to run regardless)
+#   bot           — Telegram bot; talks to vision-server over the compose network
+#
+# GPU access requires the NVIDIA Container Toolkit (present on RunPod).
+# On RunPod you can also just run `python bot.py` + `uvicorn` directly without compose.
+
+services:
+  vision-server:
+    build: .
+    command: uvicorn server:app --host 0.0.0.0 --port 8100 --app-dir vision_server
+    env_file: .env
+    ports:
+      - "8100:8100"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  bot:
+    build: .
+    command: python bot.py
+    env_file: .env
+    # When VISION_BACKEND=local the bot reaches the server by service name.
+    environment:
+      - LOCAL_VISION_URL=http://vision-server:8100/v1/chat/completions
+    # service_started (not _healthy) so groq mode isn't blocked if you don't run
+    # the vision server. For local mode, the bot retries vision calls per-request.
+    depends_on:
+      - vision-server

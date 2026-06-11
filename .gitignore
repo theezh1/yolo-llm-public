@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Model weights — auto-downloaded at runtime (ultralytics fetches yolo11n.pt
+# on first run), keep repo light.
+*.pt
+*.pth
+*.safetensors
+*.bin
+models/
+
+# OS / editor
+.DS_Store
+*.swp
