@@ -63,6 +63,11 @@ LAZY_LOAD = os.environ.get("VISION_LAZY_LOAD", "1").strip() not in ("0", "false"
 HF_TOKEN = os.environ.get("HF_TOKEN") or None
 FASTVLM_MODEL_PATH = os.environ.get("FASTVLM_MODEL_PATH", "").strip() or None
 FASTVLM_CONV_MODE = os.environ.get("FASTVLM_CONV_MODE", "qwen_2").strip()
+# ONNX backend (onnx-community/FastVLM-0.5B-ONNX — 3-graph transformers.js layout)
+ONNX_MODEL_PATH = os.environ.get("ONNX_MODEL_PATH", "").strip() or None
+ONNX_QUANT = os.environ.get("ONNX_QUANT", "q4").strip()          # decoder quant: fp16|q4|int8|...
+ONNX_ENC_QUANT = os.environ.get("ONNX_ENC_QUANT", "fp16").strip()  # vision/embed quant: fp16|<empty for fp32>
+ONNX_IMAGE_TOKEN = int(os.environ.get("ONNX_IMAGE_TOKEN", "151646"))
 
 
 def _is_fastvlm() -> bool:
@@ -76,7 +81,15 @@ def _is_lfm2() -> bool:
     return "lfm2" in MODEL_ID.lower()
 
 
+def _is_onnx() -> bool:
+    """ONNX backend selected when the model id or ONNX_MODEL_PATH mentions onnx."""
+    hay = f"{MODEL_ID} {os.environ.get('ONNX_MODEL_PATH', '')}".lower()
+    return "onnx" in hay
+
+
 def _select_backend() -> str:
+    if _is_onnx():
+        return "onnx"
     if _is_lfm2():
         return "lfm2"
     if _is_fastvlm():
@@ -97,6 +110,7 @@ _state: dict[str, Any] = {
     "device": None,
     "loaded": False,
     "backend": BACKEND,
+    "onnx_cfg": None,
 }
 
 
@@ -182,6 +196,79 @@ def _load_lfm2(device: str) -> None:
     log.info("LFM2-VL loaded.")
 
 
+def _load_onnx(device: str) -> None:
+    """Load onnx-community/FastVLM-0.5B-ONNX via raw onnxruntime (3-graph layout).
+
+    The HF repo is a transformers.js export: three separate ONNX graphs
+    (vision_encoder, embed_tokens, decoder_model_merged) that optimum's
+    ORTModelForVision2Seq cannot orchestrate (llava_qwen2 is unsupported there).
+    We drive them by hand. The AutoProcessor handles <image> placeholder expansion
+    and pixel preprocessing; we splice the vision features into the input embeddings
+    at the image-token positions, then run a greedy KV-cache decode loop.
+
+    Quant is picked per-graph via ONNX_QUANT (decoder) / ONNX_ENC_QUANT (encoder+embed).
+    """
+    import onnxruntime as ort
+    from transformers import AutoProcessor, AutoConfig
+    from huggingface_hub import snapshot_download
+
+    src = ONNX_MODEL_PATH or MODEL_ID
+    if os.path.isdir(os.path.expanduser(src)):
+        root = os.path.expanduser(src)
+    else:
+        root = snapshot_download(src, token=HF_TOKEN, revision=MODEL_REVISION)
+    onnx_dir = os.path.join(root, "onnx")
+
+    def _f(stem: str, quant: str) -> str:
+        suffix = f"_{quant}" if quant else ""
+        p = os.path.join(onnx_dir, f"{stem}{suffix}.onnx")
+        if not os.path.isfile(p):
+            p = os.path.join(onnx_dir, f"{stem}.onnx")  # fall back to fp32
+        return p
+
+    if device == "cuda":
+        providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+    else:
+        providers = ["CPUExecutionProvider"]
+    so = ort.SessionOptions()
+    so.log_severity_level = 3
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    def _sess(path: str):
+        return ort.InferenceSession(path, so, providers=providers)
+
+    log.info(f"Loading ONNX FastVLM from {onnx_dir} "
+             f"(dec={ONNX_QUANT}, enc={ONNX_ENC_QUANT}) on {device} ...")
+    vis = _sess(_f("vision_encoder", ONNX_ENC_QUANT))
+    emb = _sess(_f("embed_tokens", ONNX_ENC_QUANT))
+    dec = _sess(_f("decoder_model_merged", ONNX_QUANT))
+
+    cfg = AutoConfig.from_pretrained(root, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(root, trust_remote_code=True, token=HF_TOKEN)
+
+    # decoder input dtype for inputs_embeds / kv cache (fp16 graph wants float16)
+    import numpy as np
+    dec_in = {i.name: i.type for i in dec.get_inputs()}
+    emb_in_t = next(o.type for o in emb.get_outputs())
+    feat_t = "float16" if "float16" in str(emb_in_t) else "float32"
+    kv_t = "float16" if "float16" in dec_in.get("past_key_values.0.key", "float32") else "float32"
+
+    _state.update(
+        model={"vis": vis, "emb": emb, "dec": dec},
+        tokenizer=processor, image_processor=processor,
+        device=device, loaded=True, backend="onnx",
+        onnx_cfg={
+            "n_layers": int(getattr(cfg, "num_hidden_layers", 24)),
+            "n_kv_heads": int(getattr(cfg, "num_key_value_heads", 2)),
+            "head_dim": int(getattr(cfg, "hidden_size", 896)) // int(getattr(cfg, "num_attention_heads", 14)),
+            "image_token": ONNX_IMAGE_TOKEN,
+            "feat_dtype": feat_t,
+            "kv_dtype": kv_t,
+        },
+    )
+    log.info(f"ONNX FastVLM loaded (feat={feat_t}, kv={kv_t}).")
+
+
 def _load_moondream(device: str) -> None:
     """Load Moondream (or any generic trust_remote_code VLM) via transformers."""
     import torch
@@ -208,7 +295,9 @@ def _ensure_model() -> None:
     device = _resolve_device()
     if device == "cpu":
         log.warning("Loading vision model on CPU — this is SLOW. Use a GPU for real workloads.")
-    if BACKEND == "lfm2":
+    if BACKEND == "onnx":
+        _load_onnx(device)
+    elif BACKEND == "lfm2":
         _load_lfm2(device)
     elif BACKEND == "fastvlm":
         _load_fastvlm(device)
@@ -385,6 +474,94 @@ def _infer_lfm2(text_prompt: str, image, max_tokens: int) -> str:
     return text.strip()
 
 
+def _infer_onnx(text_prompt: str, image, max_tokens: int) -> str:
+    """Greedy decode onnx-community/FastVLM-0.5B-ONNX over 3 raw ONNX graphs.
+
+    Steps:
+      1. processor builds input_ids (with <image> placeholders expanded) + pixel_values.
+      2. embed_tokens -> inputs_embeds; vision_encoder(pixel_values) -> image_features.
+      3. splice image_features into inputs_embeds at image-token positions.
+      4. prefill decoder, then greedy-loop with KV cache to max_tokens (early-stop on EOS).
+    """
+    import numpy as np
+
+    sess = _state["model"]
+    processor = _state["image_processor"]
+    cfg = _state["onnx_cfg"]
+    vis, emb, dec = sess["vis"], sess["emb"], sess["dec"]
+    feat_np = np.float16 if cfg["feat_dtype"] == "float16" else np.float32
+    kv_np = np.float16 if cfg["kv_dtype"] == "float16" else np.float32
+    n_layers, n_kv, hd = cfg["n_layers"], cfg["n_kv_heads"], cfg["head_dim"]
+    img_tok = cfg["image_token"]
+
+    # 1) Build the chat prompt with an <image> placeholder, then process.
+    # FastVLM/LLaVA processors expand a single <image> token into the right
+    # number of placeholder tokens once pixel_values are known.
+    messages = [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": text_prompt or "Describe the image."}]}]
+    try:
+        proc_inputs = processor.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True,
+            return_dict=True, return_tensors="np", images=[image],
+        )
+    except Exception:
+        # Fallback: plain processor call with a literal <image>\n prompt.
+        prompt = f"<image>\n{text_prompt or 'Describe the image.'}"
+        proc_inputs = processor(text=prompt, images=image, return_tensors="np")
+
+    input_ids = np.asarray(proc_inputs["input_ids"]).astype(np.int64)
+    pixel_values = np.asarray(proc_inputs["pixel_values"]).astype(feat_np)
+
+    # 2) embeddings + vision features
+    inputs_embeds = emb.run(["inputs_embeds"], {"input_ids": input_ids})[0].astype(feat_np)
+    image_features = vis.run(["image_features"], {"pixel_values": pixel_values})[0].astype(feat_np)
+
+    # 3) splice image features into the embed sequence at image-token positions
+    mask = input_ids[0] == img_tok
+    n_img = int(mask.sum())
+    if n_img > 0:
+        feats = image_features.reshape(-1, image_features.shape[-1])
+        inputs_embeds[0, mask, :] = feats[: n_img].astype(feat_np)
+
+    seq_len = inputs_embeds.shape[1]
+    eos_id = getattr(processor, "tokenizer", processor)
+    eos_id = getattr(eos_id, "eos_token_id", None)
+
+    # 4) prefill + greedy loop
+    past = {f"past_key_values.{i}.{kind}": np.zeros((1, n_kv, 0, hd), dtype=kv_np)
+            for i in range(n_layers) for kind in ("key", "value")}
+    attention_mask = np.ones((1, seq_len), dtype=np.int64)
+    position_ids = np.arange(seq_len, dtype=np.int64)[None, :]
+    cur_embeds = inputs_embeds
+    generated: list[int] = []
+
+    for step in range(max_tokens):
+        feeds = {"inputs_embeds": cur_embeds, "attention_mask": attention_mask,
+                 "position_ids": position_ids}
+        feeds.update(past)
+        out_names = ["logits"] + [f"present.{i}.{k}" for i in range(n_layers) for k in ("key", "value")]
+        outputs = dec.run(out_names, feeds)
+        logits = outputs[0]
+        next_id = int(np.argmax(logits[0, -1, :]))
+        generated.append(next_id)
+        if eos_id is not None and next_id == eos_id:
+            break
+        # roll KV cache forward
+        for idx, name in enumerate(out_names[1:]):
+            layer = name.split(".")[1]
+            kind = name.split(".")[2]
+            past[f"past_key_values.{layer}.{kind}"] = outputs[idx + 1]
+        # next step: single token
+        nid = np.array([[next_id]], dtype=np.int64)
+        cur_embeds = emb.run(["inputs_embeds"], {"input_ids": nid})[0].astype(feat_np)
+        total = attention_mask.shape[1] + 1
+        attention_mask = np.ones((1, total), dtype=np.int64)
+        position_ids = np.array([[total - 1]], dtype=np.int64)
+
+    tok = getattr(processor, "tokenizer", processor)
+    return tok.decode(generated, skip_special_tokens=True).strip()
+
+
 def _infer_moondream(text_prompt: str, image, max_tokens: int) -> str:
     import torch
     model = _state["model"]
@@ -412,7 +589,9 @@ def _infer_moondream(text_prompt: str, image, max_tokens: int) -> str:
 def _run_inference(text_prompt: str, image, max_tokens: int) -> tuple[str, float]:
     """Dispatch to the active backend. Returns (raw_text, inference_ms)."""
     t0 = time.perf_counter()
-    if _state["backend"] == "lfm2":
+    if _state["backend"] == "onnx":
+        raw = _infer_onnx(text_prompt, image, max_tokens)
+    elif _state["backend"] == "lfm2":
         raw = _infer_lfm2(text_prompt, image, max_tokens)
     elif _state["backend"] == "fastvlm":
         raw = _infer_fastvlm(text_prompt, image, max_tokens)
