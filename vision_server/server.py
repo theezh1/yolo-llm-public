@@ -209,14 +209,24 @@ def _load_onnx(device: str) -> None:
     Quant is picked per-graph via ONNX_QUANT (decoder) / ONNX_ENC_QUANT (encoder+embed).
     """
     import onnxruntime as ort
-    from transformers import AutoProcessor, AutoConfig
+    from transformers import AutoTokenizer, CLIPImageProcessor
     from huggingface_hub import snapshot_download
 
     src = ONNX_MODEL_PATH or MODEL_ID
     if os.path.isdir(os.path.expanduser(src)):
         root = os.path.expanduser(src)
     else:
-        root = snapshot_download(src, token=HF_TOKEN, revision=MODEL_REVISION)
+        # llava_qwen2 isn't a registered transformers arch, so we pull files
+        # explicitly (no AutoModel) and drive the ONNX graphs by hand.
+        quants = {ONNX_QUANT, ONNX_ENC_QUANT}
+        patterns = ["*.json", "*.txt", "tokenizer*", "vocab*", "merges*",
+                    "special_tokens*", "added_tokens*"]
+        for stem in ("vision_encoder", "embed_tokens", "decoder_model_merged"):
+            for q in quants:
+                patterns.append(f"onnx/{stem}_{q}.onnx")
+                patterns.append(f"onnx/{stem}_{q}.onnx_data")
+        root = snapshot_download(src, token=HF_TOKEN, revision=MODEL_REVISION,
+                                 allow_patterns=patterns)
     onnx_dir = os.path.join(root, "onnx")
 
     def _f(stem: str, quant: str) -> str:
@@ -243,30 +253,40 @@ def _load_onnx(device: str) -> None:
     emb = _sess(_f("embed_tokens", ONNX_ENC_QUANT))
     dec = _sess(_f("decoder_model_merged", ONNX_QUANT))
 
-    cfg = AutoConfig.from_pretrained(root, trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(root, trust_remote_code=True, token=HF_TOKEN)
+    # llava_qwen2 has no transformers arch, but its sub-components load directly:
+    # the LM tokenizer is plain Qwen2, the image processor is CLIPImageProcessor.
+    tokenizer = AutoTokenizer.from_pretrained(root, token=HF_TOKEN)
+    image_processor = CLIPImageProcessor.from_pretrained(root, token=HF_TOKEN)
+
+    import json as _json
+    cfg = {}
+    cfg_path = os.path.join(root, "config.json")
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as fh:
+            cfg = _json.load(fh)
 
     # decoder input dtype for inputs_embeds / kv cache (fp16 graph wants float16)
-    import numpy as np
     dec_in = {i.name: i.type for i in dec.get_inputs()}
-    emb_in_t = next(o.type for o in emb.get_outputs())
-    feat_t = "float16" if "float16" in str(emb_in_t) else "float32"
+    emb_out_t = next(o.type for o in emb.get_outputs())
+    feat_t = "float16" if "float16" in str(emb_out_t) else "float32"
     kv_t = "float16" if "float16" in dec_in.get("past_key_values.0.key", "float32") else "float32"
 
+    n_heads = int(cfg.get("num_attention_heads", 14))
+    hidden = int(cfg.get("hidden_size", 896))
     _state.update(
         model={"vis": vis, "emb": emb, "dec": dec},
-        tokenizer=processor, image_processor=processor,
+        tokenizer=tokenizer, image_processor=image_processor,
         device=device, loaded=True, backend="onnx",
         onnx_cfg={
-            "n_layers": int(getattr(cfg, "num_hidden_layers", 24)),
-            "n_kv_heads": int(getattr(cfg, "num_key_value_heads", 2)),
-            "head_dim": int(getattr(cfg, "hidden_size", 896)) // int(getattr(cfg, "num_attention_heads", 14)),
-            "image_token": ONNX_IMAGE_TOKEN,
+            "n_layers": int(cfg.get("num_hidden_layers", 24)),
+            "n_kv_heads": int(cfg.get("num_key_value_heads", 2)),
+            "head_dim": hidden // n_heads,
+            "image_token": int(cfg.get("image_token_index", ONNX_IMAGE_TOKEN)),
             "feat_dtype": feat_t,
             "kv_dtype": kv_t,
         },
     )
-    log.info(f"ONNX FastVLM loaded (feat={feat_t}, kv={kv_t}).")
+    log.info(f"ONNX FastVLM loaded (feat={feat_t}, kv={kv_t}, img_tok={_state['onnx_cfg']['image_token']}).")
 
 
 def _load_moondream(device: str) -> None:
@@ -486,7 +506,8 @@ def _infer_onnx(text_prompt: str, image, max_tokens: int) -> str:
     import numpy as np
 
     sess = _state["model"]
-    processor = _state["image_processor"]
+    tokenizer = _state["tokenizer"]
+    image_processor = _state["image_processor"]
     cfg = _state["onnx_cfg"]
     vis, emb, dec = sess["vis"], sess["emb"], sess["dec"]
     feat_np = np.float16 if cfg["feat_dtype"] == "float16" else np.float32
@@ -494,38 +515,32 @@ def _infer_onnx(text_prompt: str, image, max_tokens: int) -> str:
     n_layers, n_kv, hd = cfg["n_layers"], cfg["n_kv_heads"], cfg["head_dim"]
     img_tok = cfg["image_token"]
 
-    # 1) Build the chat prompt with an <image> placeholder, then process.
-    # FastVLM/LLaVA processors expand a single <image> token into the right
-    # number of placeholder tokens once pixel_values are known.
-    messages = [{"role": "user", "content": [
-        {"type": "image"}, {"type": "text", "text": text_prompt or "Describe the image."}]}]
-    try:
-        proc_inputs = processor.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=True,
-            return_dict=True, return_tensors="np", images=[image],
-        )
-    except Exception:
-        # Fallback: plain processor call with a literal <image>\n prompt.
-        prompt = f"<image>\n{text_prompt or 'Describe the image.'}"
-        proc_inputs = processor(text=prompt, images=image, return_tensors="np")
-
-    input_ids = np.asarray(proc_inputs["input_ids"]).astype(np.int64)
-    pixel_values = np.asarray(proc_inputs["pixel_values"]).astype(feat_np)
-
-    # 2) embeddings + vision features
-    inputs_embeds = emb.run(["inputs_embeds"], {"input_ids": input_ids})[0].astype(feat_np)
+    # 1) Preprocess the image -> pixel_values, run the vision encoder to learn how
+    # many image tokens it produces (FastVLM downsamples by 64 -> ~256 for 1024px).
+    pix = image_processor(images=image, return_tensors="np")["pixel_values"]
+    pixel_values = np.asarray(pix).astype(feat_np)
     image_features = vis.run(["image_features"], {"pixel_values": pixel_values})[0].astype(feat_np)
+    n_img = int(image_features.reshape(-1, image_features.shape[-1]).shape[0])
 
-    # 3) splice image features into the embed sequence at image-token positions
+    # 2) Build the Qwen2 chat prompt with exactly n_img image placeholder tokens
+    # spliced in. Qwen2 (llava) format: system + user turn with <image> block.
+    user_text = text_prompt or "Describe the image."
+    pre = ("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+           "<|im_start|>user\n")
+    post = f"\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+    pre_ids = tokenizer(pre, add_special_tokens=False)["input_ids"]
+    post_ids = tokenizer(post, add_special_tokens=False)["input_ids"]
+    ids = pre_ids + [img_tok] * n_img + post_ids
+    input_ids = np.array([ids], dtype=np.int64)
+
+    # 3) embeddings, then splice vision features at the image-token positions
+    inputs_embeds = emb.run(["inputs_embeds"], {"input_ids": input_ids})[0].astype(feat_np)
     mask = input_ids[0] == img_tok
-    n_img = int(mask.sum())
-    if n_img > 0:
-        feats = image_features.reshape(-1, image_features.shape[-1])
-        inputs_embeds[0, mask, :] = feats[: n_img].astype(feat_np)
+    feats = image_features.reshape(-1, image_features.shape[-1])
+    inputs_embeds[0, mask, :] = feats[: int(mask.sum())].astype(feat_np)
 
     seq_len = inputs_embeds.shape[1]
-    eos_id = getattr(processor, "tokenizer", processor)
-    eos_id = getattr(eos_id, "eos_token_id", None)
+    eos_id = tokenizer.eos_token_id
 
     # 4) prefill + greedy loop
     past = {f"past_key_values.{i}.{kind}": np.zeros((1, n_kv, 0, hd), dtype=kv_np)
@@ -558,8 +573,7 @@ def _infer_onnx(text_prompt: str, image, max_tokens: int) -> str:
         attention_mask = np.ones((1, total), dtype=np.int64)
         position_ids = np.array([[total - 1]], dtype=np.int64)
 
-    tok = getattr(processor, "tokenizer", processor)
-    return tok.decode(generated, skip_special_tokens=True).strip()
+    return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
 def _infer_moondream(text_prompt: str, image, max_tokens: int) -> str:
