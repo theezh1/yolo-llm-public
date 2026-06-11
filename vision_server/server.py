@@ -87,11 +87,26 @@ def _is_onnx() -> bool:
     return "onnx" in hay
 
 
+def _is_llama() -> bool:
+    """Llama-Vision backend selected when the model id mentions llama (Llama-3.2-Vision)."""
+    return "llama" in MODEL_ID.lower()
+
+
+def _is_ocr() -> bool:
+    """PaddleOCR backend selected when LOCAL_VISION_MODEL or VISION_BACKEND == 'ocr'."""
+    return MODEL_ID.strip().lower() == "ocr" or \
+        os.environ.get("VISION_BACKEND", "").strip().lower() == "ocr"
+
+
 def _select_backend() -> str:
+    if _is_ocr():
+        return "ocr"
     if _is_onnx():
         return "onnx"
     if _is_lfm2():
         return "lfm2"
+    if _is_llama():
+        return "llama"
     if _is_fastvlm():
         return "fastvlm"
     return "moondream"
@@ -194,6 +209,77 @@ def _load_lfm2(device: str) -> None:
     _state.update(model=model, tokenizer=processor, image_processor=processor,
                   device=device, loaded=True, backend="lfm2")
     log.info("LFM2-VL loaded.")
+
+
+def _load_llama(device: str) -> None:
+    """Load Llama-3.2-11B-Vision-Instruct in 4-bit (bitsandbytes).
+
+    Llama-3.2-Vision is an Mllama architecture VLM. It loads via
+    MllamaForConditionalGeneration + AutoProcessor. We quantise to 4-bit with
+    BitsAndBytesConfig (nf4, double-quant, bf16 compute) — fits the 11B in ~7GB.
+    Works with the open unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit
+    (no gating) or meta-llama/Llama-3.2-11B-Vision-Instruct (gated, needs HF_TOKEN).
+    The chat template injects an <|image|> tile for the image part.
+    """
+    import torch
+    from transformers import (
+        MllamaForConditionalGeneration, AutoProcessor, BitsAndBytesConfig,
+    )
+
+    # The unsloth *-bnb-4bit checkpoints ship pre-quantised; passing a fresh
+    # BitsAndBytesConfig is still accepted and is required for non-prequantised
+    # repos (meta-llama). bf16 compute keeps quality high on the A40.
+    is_prequant = "4bit" in MODEL_ID.lower() or "bnb" in MODEL_ID.lower()
+    quant_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+    log.info(
+        f"Loading Llama-3.2-Vision {MODEL_ID} 4-bit on {device} "
+        f"(prequant={is_prequant}) ..."
+    )
+    kwargs: dict[str, Any] = dict(
+        device_map="auto" if device == "cuda" else None,
+        token=HF_TOKEN,
+        revision=MODEL_REVISION,
+    )
+    # Prequantised repos already carry quantization_config in their config.json;
+    # supplying our own would override the compute dtype, which is fine, but we
+    # keep it for both paths to force nf4 + bf16 compute deterministically.
+    kwargs["quantization_config"] = quant_cfg
+    model = MllamaForConditionalGeneration.from_pretrained(MODEL_ID, **kwargs)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(
+        MODEL_ID, token=HF_TOKEN, revision=MODEL_REVISION
+    )
+    _state.update(model=model, tokenizer=processor, image_processor=processor,
+                  device=device, loaded=True, backend="llama")
+    log.info("Llama-3.2-Vision (4-bit) loaded.")
+
+
+def _load_ocr(device: str) -> None:
+    """Load PaddleOCR (detector + recogniser). Deterministic text reader, no LLM.
+
+    Tries GPU first (paddlepaddle-gpu); PaddleOCR falls back to CPU automatically
+    if the GPU build/CUDA isn't available. English model, angle classifier on.
+    """
+    from paddleocr import PaddleOCR
+
+    use_gpu = device == "cuda"
+    log.info(f"Loading PaddleOCR (use_gpu={use_gpu}) ...")
+    ocr = None
+    # PaddleOCR's constructor signature changed across versions (use_gpu was
+    # removed in 2.7+, replaced by the paddle device env). Try the modern call
+    # first, fall back to the legacy one.
+    try:
+        ocr = PaddleOCR(use_angle_cls=True, lang="en")
+    except TypeError:
+        ocr = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=use_gpu)
+    _state.update(model=ocr, tokenizer=None, image_processor=None,
+                  device=device, loaded=True, backend="ocr")
+    log.info("PaddleOCR loaded.")
 
 
 def _load_onnx(device: str) -> None:
@@ -315,10 +401,14 @@ def _ensure_model() -> None:
     device = _resolve_device()
     if device == "cpu":
         log.warning("Loading vision model on CPU — this is SLOW. Use a GPU for real workloads.")
-    if BACKEND == "onnx":
+    if BACKEND == "ocr":
+        _load_ocr(device)
+    elif BACKEND == "onnx":
         _load_onnx(device)
     elif BACKEND == "lfm2":
         _load_lfm2(device)
+    elif BACKEND == "llama":
+        _load_llama(device)
     elif BACKEND == "fastvlm":
         _load_fastvlm(device)
     else:
@@ -600,13 +690,159 @@ def _infer_moondream(text_prompt: str, image, max_tokens: int) -> str:
     return tok.batch_decode(out_ids, skip_special_tokens=True)[0]
 
 
+def _infer_llama(text_prompt: str, image, max_tokens: int) -> str:
+    """Run Llama-3.2-11B-Vision-Instruct (4-bit) via its chat template.
+
+    The image is passed as an {"type":"image"} content part; the processor's
+    chat template expands it to the <|image|> tile token. We extract {name,symbol}
+    of a meme token, matching the contract of the other vision backends — the
+    server's _coerce_json then cleans the output into strict JSON.
+    """
+    import torch
+
+    model = _state["model"]
+    processor = _state["image_processor"]
+
+    prompt = text_prompt or (
+        "Look at the image. Respond with ONLY a JSON object "
+        '{"name": <main subject or prominent text>, '
+        '"symbol": <uppercase 3-10 char ticker derived from name>}. '
+        "No prose, no markdown."
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    inputs = processor(image, input_text, return_tensors="pt").to(model.device)
+
+    with torch.inference_mode():
+        out_ids = model.generate(
+            **inputs, max_new_tokens=max_tokens, do_sample=False,
+            temperature=None, top_p=None,
+        )
+    gen_only = out_ids[0][inputs["input_ids"].shape[1]:]
+    text = processor.decode(gen_only, skip_special_tokens=True)
+    return text.strip()
+
+
+# ── PaddleOCR pipeline ─────────────────────────────────────────────────
+_OCR_WATERMARKS = (
+    "pump.fun", "pumpfun", "dexscreener", "dex screener", ".fun",
+    "twitter", "x.com", "t.me", "telegram", "@", "http", "www.",
+    "raydium", "jupiter", "solscan", "birdeye", "photon", "bullx",
+)
+
+
+def _run_ocr(image) -> list[tuple[str, float, float]]:
+    """Run PaddleOCR. Returns [(text, bbox_height, confidence), ...].
+
+    bbox_height (in px) is used downstream to pick the most prominent line as
+    the token name. Handles both the legacy .ocr(np_img) list-of-lists return
+    and the 3.x predict() dict return.
+    """
+    import numpy as np
+
+    ocr = _state["model"]
+    arr = np.asarray(image.convert("RGB"))  # PaddleOCR wants BGR/np or path
+    arr = arr[:, :, ::-1]  # RGB -> BGR
+
+    results: list[tuple[str, float, float]] = []
+    raw = None
+    # Legacy 2.x API: ocr.ocr(img, cls=True) -> [[ [box, (text, conf)], ... ]]
+    try:
+        raw = ocr.ocr(arr, cls=True)
+    except TypeError:
+        raw = ocr.ocr(arr)
+
+    if not raw:
+        return results
+    page = raw[0] if (isinstance(raw, list) and raw and isinstance(raw[0], list)) else raw
+    if not page:
+        return results
+    for line in page:
+        try:
+            box, (text, conf) = line[0], line[1]
+            ys = [pt[1] for pt in box]
+            height = float(max(ys) - min(ys))
+            results.append((str(text).strip(), height, float(conf)))
+        except Exception:
+            continue
+    return results
+
+
+def ocr_to_token(results: list[tuple[str, float, float]]) -> dict | None:
+    """Parse OCR lines into {name, symbol}.
+
+    - symbol: first $TICKER found via regex (uppercase letters, 3-10).
+    - name: the largest non-watermark text line (by bbox height).
+    - if no explicit ticker, derive symbol from name.
+    Returns None if no usable text.
+    """
+    if not results:
+        return None
+
+    def _is_watermark(t: str) -> bool:
+        low = t.lower()
+        return any(w in low for w in _OCR_WATERMARKS)
+
+    # 1) symbol from $TICKER anywhere in the text
+    symbol = ""
+    for text, _h, _c in results:
+        m = re.search(r"\$([A-Za-z][A-Za-z0-9]{1,9})", text)
+        if m:
+            symbol = m.group(1).upper()
+            break
+
+    # 2) name = largest non-watermark line; strip a leading $TICKER token
+    candidates = [
+        (text, h) for text, h, _c in results
+        if text and not _is_watermark(text)
+    ]
+    name = ""
+    if candidates:
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        name = candidates[0][0]
+        # drop a standalone $TICKER line being picked as the name
+        if re.fullmatch(r"\$[A-Za-z0-9]{2,10}", name.strip()) and len(candidates) > 1:
+            name = candidates[1][0]
+    if not name:
+        # fall back to any text at all
+        name = next((t for t, _h, _c in results if t), "")
+
+    name = name.strip()
+    if not name and not symbol:
+        return None
+    if not symbol:
+        symbol = _derive_symbol(name)
+    return {"name": name, "symbol": symbol}
+
+
+def _infer_ocr(text_prompt: str, image, max_tokens: int) -> str:
+    """OCR backend: read text deterministically, parse to {name,symbol} JSON."""
+    results = _run_ocr(image)
+    token = ocr_to_token(results)
+    if token is None:
+        return json.dumps({"name": "", "symbol": ""})
+    return json.dumps(token)
+
+
 def _run_inference(text_prompt: str, image, max_tokens: int) -> tuple[str, float]:
     """Dispatch to the active backend. Returns (raw_text, inference_ms)."""
     t0 = time.perf_counter()
-    if _state["backend"] == "onnx":
+    if _state["backend"] == "ocr":
+        raw = _infer_ocr(text_prompt, image, max_tokens)
+    elif _state["backend"] == "onnx":
         raw = _infer_onnx(text_prompt, image, max_tokens)
     elif _state["backend"] == "lfm2":
         raw = _infer_lfm2(text_prompt, image, max_tokens)
+    elif _state["backend"] == "llama":
+        raw = _infer_llama(text_prompt, image, max_tokens)
     elif _state["backend"] == "fastvlm":
         raw = _infer_fastvlm(text_prompt, image, max_tokens)
     else:
@@ -626,15 +862,20 @@ def _coerce_json(raw: str) -> str:
     """Coerce model output into a {"name","symbol"} JSON string."""
     raw = (raw or "").strip()
     name, symbol = "", ""
+    parsed = False
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         try:
             obj = json.loads(m.group(0))
             name = str(obj.get("name", "") or "").strip()
             symbol = str(obj.get("symbol", "") or "").strip()
+            parsed = True
         except Exception:
             pass
-    if not name:
+    # Only fall back to raw text as the name when we couldn't parse JSON at all.
+    # (A parsed-but-empty name means the backend legitimately found no text —
+    # e.g. OCR on an image with no readable token; don't echo the JSON back.)
+    if not name and not parsed:
         name = raw[:30]
     if not symbol or not re.fullmatch(r"[A-Za-z0-9]{2,10}", symbol):
         symbol = _derive_symbol(name)
