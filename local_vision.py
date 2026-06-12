@@ -47,9 +47,13 @@ async def local_extract_vision(
     short_prompt = os.environ.get(
         "LOCAL_VISION_PROMPT",
         'Name and ticker symbol of the meme token in this image. '
-        'JSON only: {"name":"...","symbol":"..."}',
+        'Output ONLY compact one-line JSON, no code fences, no markdown: '
+        '{"name":"...","symbol":"..."}',
     )
-    max_tok = int(os.environ.get("LOCAL_VISION_MAX_TOKENS", "20"))
+    # Chatty VLMs (Qwen) pretty-print + fence their JSON; 20 tokens truncates it
+    # mid-object. 40 covers a fenced, multi-line {name,symbol} pair; the server's
+    # _coerce_json still recovers a truncated one.
+    max_tok = int(os.environ.get("LOCAL_VISION_MAX_TOKENS", "40"))
 
     t0 = time.perf_counter()
     try:

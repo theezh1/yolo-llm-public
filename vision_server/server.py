@@ -933,8 +933,20 @@ def _derive_symbol(name: str) -> str:
 
 
 def _coerce_json(raw: str) -> str:
-    """Coerce model output into a {"name","symbol"} JSON string."""
+    """Coerce model output into a {"name","symbol"} JSON string.
+
+    Robust to the two ways chatty VLMs (e.g. Qwen2.5-VL) break naive parsing:
+      1. They wrap the object in a ```json … ``` markdown fence.
+      2. With a low max_tokens cap the object gets truncated before its closing
+         brace, so a `\{.*\}` match fails entirely.
+    We strip fences first, try a full parse, then fall back to pulling the
+    "name"/"symbol" fields out individually with a regex — which still works on
+    an unterminated object. A truncated/absent symbol is re-derived from name.
+    """
     raw = (raw or "").strip()
+    # 1) strip ```json … ``` / ``` code fences
+    if "```" in raw:
+        raw = re.sub(r"```(?:json)?", "", raw).strip()
     name, symbol = "", ""
     parsed = False
     m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -946,6 +958,15 @@ def _coerce_json(raw: str) -> str:
             parsed = True
         except Exception:
             pass
+    # 2) full parse failed (often truncated JSON) — pull fields individually.
+    if not parsed:
+        mn = re.search(r'"name"\s*:\s*"([^"]*)"', raw)
+        ms = re.search(r'"symbol"\s*:\s*"([^"]*)"', raw)
+        if mn:
+            name = mn.group(1).strip()
+            parsed = True
+        if ms:
+            symbol = ms.group(1).strip()
     # Only fall back to raw text as the name when we couldn't parse JSON at all.
     # (A parsed-but-empty name means the backend legitimately found no text —
     # e.g. OCR on an image with no readable token; don't echo the JSON back.)
