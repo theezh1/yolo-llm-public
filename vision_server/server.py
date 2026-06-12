@@ -92,6 +92,11 @@ def _is_llama() -> bool:
     return "llama" in MODEL_ID.lower()
 
 
+def _is_qwen() -> bool:
+    """Qwen2.5-VL backend selected when the model id mentions qwen."""
+    return "qwen" in MODEL_ID.lower()
+
+
 def _is_ocr() -> bool:
     """PaddleOCR backend selected when LOCAL_VISION_MODEL or VISION_BACKEND == 'ocr'."""
     return MODEL_ID.strip().lower() == "ocr" or \
@@ -105,6 +110,8 @@ def _select_backend() -> str:
         return "onnx"
     if _is_lfm2():
         return "lfm2"
+    if _is_qwen():
+        return "qwen"
     if _is_llama():
         return "llama"
     if _is_fastvlm():
@@ -259,6 +266,37 @@ def _load_llama(device: str) -> None:
     log.info("Llama-3.2-Vision (4-bit) loaded.")
 
 
+def _load_qwen(device: str) -> None:
+    """Load Qwen2.5-VL-Instruct (image-text-to-text) in bf16.
+
+    Qwen2.5-VL is a strong small VLM that actually *names* subjects/characters
+    (where 450M-1B models give garbage). 3B fits comfortably in bf16 (~7GB) on a
+    4090, no quantisation needed. Loads via Qwen2_5_VLForConditionalGeneration +
+    AutoProcessor; the chat template handles the <|vision|> image tokens.
+    """
+    import torch
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    log.info(f"Loading Qwen2.5-VL {MODEL_ID} on {device} (dtype={dtype}) ...")
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        device_map="auto" if device == "cuda" else None,
+        dtype=dtype,
+        token=HF_TOKEN,
+        revision=MODEL_REVISION,
+    )
+    if device != "cuda":
+        model = model.to(device)
+    model.eval()
+    processor = AutoProcessor.from_pretrained(
+        MODEL_ID, token=HF_TOKEN, revision=MODEL_REVISION
+    )
+    _state.update(model=model, tokenizer=processor, image_processor=processor,
+                  device=device, loaded=True, backend="qwen")
+    log.info("Qwen2.5-VL loaded.")
+
+
 def _load_ocr(device: str) -> None:
     """Load PaddleOCR (detector + recogniser). Deterministic text reader, no LLM.
 
@@ -407,6 +445,8 @@ def _ensure_model() -> None:
         _load_onnx(device)
     elif BACKEND == "lfm2":
         _load_lfm2(device)
+    elif BACKEND == "qwen":
+        _load_qwen(device)
     elif BACKEND == "llama":
         _load_llama(device)
     elif BACKEND == "fastvlm":
@@ -731,6 +771,38 @@ def _infer_llama(text_prompt: str, image, max_tokens: int) -> str:
     return text.strip()
 
 
+def _infer_qwen(text_prompt: str, image, max_tokens: int) -> str:
+    """Run Qwen2.5-VL via its chat template. Extract {name,symbol}."""
+    import torch
+
+    model = _state["model"]
+    processor = _state["image_processor"]
+
+    prompt = text_prompt or (
+        "Identify the main character, subject, or prominent text in this image. "
+        'Respond with ONLY a JSON object {"name": <short name>, '
+        '"symbol": <uppercase 3-10 char ticker derived from the name>}. '
+        "No prose, no markdown."
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt},
+            ],
+        }
+    ]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = processor(text=[text], images=[image], return_tensors="pt").to(model.device)
+    with torch.inference_mode():
+        out_ids = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False)
+    gen_only = out_ids[0][inputs["input_ids"].shape[1]:]
+    return processor.decode(gen_only, skip_special_tokens=True).strip()
+
+
 # ── PaddleOCR pipeline ─────────────────────────────────────────────────
 _OCR_WATERMARKS = (
     "pump.fun", "pumpfun", "dexscreener", "dex screener", ".fun",
@@ -841,6 +913,8 @@ def _run_inference(text_prompt: str, image, max_tokens: int) -> tuple[str, float
         raw = _infer_onnx(text_prompt, image, max_tokens)
     elif _state["backend"] == "lfm2":
         raw = _infer_lfm2(text_prompt, image, max_tokens)
+    elif _state["backend"] == "qwen":
+        raw = _infer_qwen(text_prompt, image, max_tokens)
     elif _state["backend"] == "llama":
         raw = _infer_llama(text_prompt, image, max_tokens)
     elif _state["backend"] == "fastvlm":
